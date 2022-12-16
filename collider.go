@@ -20,7 +20,8 @@ import (
 
 const (
 	// mask selects the bits to be collided.
-	mask = (1 << 64) - 1
+	mask      = (1 << 64) - 1
+	shortMask = (1 << 32) - 1
 
 	// distingish is a mask that determintes the average hash chain length.
 	// A chain ends when these bits are all zero. This sets the trade-off
@@ -65,7 +66,7 @@ type link struct {
 // Returns the final truncated key ID of a hash chain starting at the
 // given seed, as well as the length of the chain. If not nil, the chain
 // itself is recorded into the link slice for inspection.
-func computeChain(seed uint64, created int64, record *[]link) (uint64, int) {
+func computeChain(seed uint64, created int64, shortID uint, record *[]link) (uint64, int) {
 	var kseed [32]byte
 	var key openpgp.SignKey
 	key.SetCreated(created)
@@ -78,6 +79,9 @@ func computeChain(seed uint64, created int64, record *[]link) (uint64, int) {
 			*record = append(*record, link{seed, truncID})
 		}
 		seed = truncID
+		if shortID != 0 && uint(truncID&shortMask) == shortID {
+			return truncID, count
+		}
 		if truncID&distinguish == 0 {
 			return truncID, count
 		}
@@ -119,11 +123,54 @@ func consumer(chains <-chan chain, config *config) {
 		log.Printf("chains %d, keys %d, keys/sec %.0f\n",
 			len(seen)+1, total, rate)
 
+		if config.shortID != 0 {
+			if uint(chain.truncID&shortMask) != config.shortID {
+				continue
+			}
+
+			// Recreate chain, but record all the links this time.
+			var record []link
+			computeChain(chain.seed, config.created, config.shortID, &record)
+
+			for _, link := range record {
+				if uint(link.truncID&shortMask) != config.shortID {
+					continue
+				}
+				duration := time.Now().Sub(start)
+				log.Printf("duration %s\n", duration)
+
+				var buf bytes.Buffer
+				userid := openpgp.UserID{ID: []byte(config.uid)}
+				var kseed [32]byte
+
+				// Recreate and self-sign the key
+				var key openpgp.SignKey
+				expand(kseed[:], link.seed)
+				key.Seed(kseed[:])
+				key.SetCreated(config.created)
+				if config.public {
+					buf.Write(key.PubPacket())
+				} else {
+					buf.Write(key.Packet())
+				}
+				buf.Write(userid.Packet())
+				buf.Write(key.SelfSign(&userid, config.created, 0))
+				armor := openpgp.Armor(buf.Bytes())
+				if _, err := os.Stdout.Write(armor); err != nil {
+					fatal("%s", err)
+				}
+
+				log.Printf("key ID %X\n", key.KeyID())
+
+				os.Exit(0)
+			}
+		}
+
 		if seed, ok := seen[chain.truncID]; ok {
 			// Recreate chains, but record all the links this time.
 			var recordA, recordB []link
-			computeChain(seed, config.created, &recordA)
-			computeChain(chain.seed, config.created, &recordB)
+			computeChain(seed, config.created, 0, &recordA)
+			computeChain(chain.seed, config.created, 0, &recordB)
 
 			mapB := make(map[uint64]uint64)
 			for _, link := range recordB {
@@ -191,11 +238,11 @@ func consumer(chains <-chan chain, config *config) {
 }
 
 // Start a bunch of local chain builders.
-func startWorkers(seeds <-chan uint64, chains chan<- chain, created int64) {
+func startWorkers(seeds <-chan uint64, chains chan<- chain, created int64, shortID uint) {
 	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
 		go func() {
 			for seed := range seeds {
-				truncID, length := computeChain(seed, created, nil)
+				truncID, length := computeChain(seed, created, shortID, nil)
 				chains <- chain{seed, truncID, length}
 			}
 		}()
@@ -288,6 +335,7 @@ type config struct {
 	public  bool
 	created int64
 	uid     string
+	shortID uint
 	verbose bool
 }
 
@@ -304,6 +352,7 @@ func parse() *config {
 		{"public", 'p', optparse.KindNone},
 		{"time", 't', optparse.KindRequired},
 		{"uid", 'u', optparse.KindRequired},
+		{"shortid", 's', optparse.KindRequired},
 		{"verbose", 'v', optparse.KindNone},
 	}
 
@@ -332,6 +381,12 @@ func parse() *config {
 			config.created = int64(time)
 		case "uid":
 			config.uid = result.Optarg
+		case "shortid":
+			shortID, err := strconv.ParseUint(result.Optarg, 16, 32)
+			if err != nil {
+				fatal("--shortid (-s): %s", err)
+			}
+			config.shortID = uint(shortID)
 		case "verbose":
 			config.verbose = true
 		}
@@ -363,6 +418,7 @@ func usage(w io.Writer) {
 	f(i, "-p, --public           only output the public key")
 	f(i, "-t, --time SECONDS     key creation date (unix epoch seconds)")
 	f(i, "-u, --uid USERID       user ID for the keys")
+	f(i, "-s, --shortid SHORTID  generate key that collides with this short ID")
 	f(i, "-v, --verbose          print progress information")
 	bw.Flush()
 }
@@ -381,7 +437,7 @@ func main() {
 		// Feed unique seeds one at a time to the workers.
 		go seeder(seeds)
 		// Spin off workers to create chains.
-		startWorkers(seeds, chains, config.created)
+		startWorkers(seeds, chains, config.created, config.shortID)
 		consumer(chains, config)
 	case cmdClient:
 		conn, err := net.Dial("tcp", config.addr)
@@ -396,7 +452,7 @@ func main() {
 		created := int64(binary.BigEndian.Uint32(buf[:]))
 		// Set up pipeline
 		go netSeeder(seeds, conn)
-		startWorkers(seeds, chains, created)
+		startWorkers(seeds, chains, created, config.shortID)
 		netConsumer(chains, conn)
 	case cmdServer:
 		// Set up pipeline
